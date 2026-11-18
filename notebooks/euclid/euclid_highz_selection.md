@@ -125,7 +125,7 @@ P_LOW_MAX = 0.05     # ... at most this much
 
 # Section 6: number of candidates to follow up, side of the forced photometry field and of the stamps (arcsec).
 N_FOLLOWUP = 3
-FOLLOWUP_SIZE = 40.0
+FOLLOWUP_SIZE = 20.0
 STAMP_SIZE = 8.0
 ```
 
@@ -537,6 +537,17 @@ Two settings matter for dropouts:
 
 The IRAC images are the mosaics of the Cosmic Dawn Survey (`mosaic_backend='dawn'`), which cover about half of EDF-N.
 
+We fit a small field of 20 arcsec around each candidate (`FOLLOWUP_SIZE`).
+The Euclid Deep Fields are crowded: a field of this size has about 20 MER sources, and one of 40 arcsec has about 100.
+The fit of a small field is fast and needs little memory.
+It also has less risk that the shape of one source is fit badly: in a larger field we had one case in which the model of a source grew very large and the IRAC fit ran out of memory.
+The price is in the IRAC fluxes.
+Sources outside the field are not modeled, and the IRAC PSF spreads some of their light into the field, so the IRAC fluxes of our candidates are about 5% higher than in a fit of 40 arcsec.
+The fluxes in the Euclid bands are the same in both.
+This is accurate enough here, where the question is whether a candidate is one or two magnitudes brighter in IRAC than in $H_E$.
+
+The function tries the fit with IRAC twice, because the archive services sometimes time out, and then without IRAC, for the positions that have no IRAC mosaic.
+
 ```{code-cell} ipython3
 def measure_field(ra, dec):
     """Forced photometry of all MER sources in a small field, in the Euclid bands and IRAC channels 1 and 2.
@@ -548,23 +559,25 @@ def measure_field(ra, dec):
 
     Returns
     -------
-    euclid_phot.ForcedPhotometryResult
+    euclid_phot.ForcedPhotometryResult or None
         The fit. If the position has no IRAC mosaic, the result has the Euclid bands only.
+        None if all attempts failed.
     """
-    settings = {'prior': {'band': 'H', 'objects': 'mer'}, 'n_workers': 4, 'verbose': False}
-    with warnings.catch_warnings():
-        warnings.simplefilter('ignore')
+    with_irac = {'target_bands': {'euclid': ('VIS', 'Y', 'J'), 'irac': ('IRAC1', 'IRAC2')},
+                 'irac_options': {'mosaic_backend': 'dawn'}}
+    euclid_only = {'target_bands': {'euclid': ('VIS', 'Y', 'J')}}
+    for attempt in (with_irac, with_irac, euclid_only):
         try:
-            return ep.run_forced_photometry(ra, dec, FOLLOWUP_SIZE,
-                                            target_bands={'euclid': ('VIS', 'Y', 'J'), 'irac': ('IRAC1', 'IRAC2')},
-                                            irac_options={'mosaic_backend': 'dawn'}, **settings)
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore')
+                return ep.run_forced_photometry(ra, dec, FOLLOWUP_SIZE, prior={'band': 'H', 'objects': 'mer'},
+                                                n_workers=4, verbose=False, **attempt)
         except Exception as error:
-            print(f'No IRAC photometry at ({ra:.4f}, {dec:.4f}): {error}')
-            return ep.run_forced_photometry(ra, dec, FOLLOWUP_SIZE, target_bands={'euclid': ('VIS', 'Y', 'J')},
-                                            **settings)
+            print(f"Fit at ({ra:.4f}, {dec:.4f}) with bands {attempt['target_bands']} failed: {error}")
+    return None
 ```
 
-Each field takes one to two minutes, so we follow up `N_FOLLOWUP` candidates: the ones at the highest redshifts.
+Each field takes about half a minute. We follow up `N_FOLLOWUP` candidates: the ones at the highest redshifts.
 Increase `N_FOLLOWUP` to look at more.
 
 ```{code-cell} ipython3
@@ -584,10 +597,10 @@ for band in FORCED_BANDS:
     followup[f'forced_error_{band}'] = np.nan
 
 for row, field in zip(followup, fields):
-    photometry = field.to_table(ebv=None)
-    match = photometry[photometry['object_id'] == row['object_id']]
+    photometry = field.to_table(ebv=None) if field is not None else None
+    match = photometry[photometry['object_id'] == row['object_id']] if field is not None else []
     if len(match) == 0:
-        # The H-band fit can drop a source, for example one at the edge of a mask.
+        # The fit failed, or it dropped the source, for example at the edge of a mask.
         print(f"{row['object_id']} has no forced photometry")
         continue
     for band in FORCED_BANDS:
@@ -654,7 +667,7 @@ for row_index, (row, field) in enumerate(zip(followup, fields)):
         ax = fig.add_subplot(grid[row_index, column])
         try:
             images = field.image_set(band)
-        except (ValueError, KeyError):
+        except (AttributeError, ValueError, KeyError):
             ax.axis('off')
             continue
         show_stamp(ax, images['data'], images['wcs'], row['ra'], row['dec'], STAMP_SIZE, stamp_labels[band])
