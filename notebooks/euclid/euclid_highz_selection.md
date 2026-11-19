@@ -109,6 +109,95 @@ ep.set_data_access('DR1')
 %matplotlib inline
 ```
 
+EAZY keeps its templates and filter curves in the directory of its Python package, and downloads them from GitHub if they are not there.
+We use them for the SED fits of Section 3, and for the next figure.
+
+```{code-cell} ipython3
+if not os.path.exists(os.path.join(eazy.utils.DATA_PATH, 'templates')):
+    eazy.fetch_eazy_photoz()
+    eazy.set_data_path()
+
+# EAZY writes and reads its input catalog here.
+os.makedirs('output', exist_ok=True)
+```
+
+## What a z > 6 galaxy looks like in the Euclid bands
+
+Before selecting anything, we plot the three kinds of sources that this notebook is about, with the filters we use.
+The model spectra are from the template files of EAZY: a young galaxy with little dust, which we place at z = 7 and absorb blueward of Lyman-α with the model of the intergalactic medium of Inoue et al. (2014); an old and dusty galaxy, which we place at z = 2.3; and a brown dwarf with an effective temperature of 1200 K (a T dwarf), from the BT-Settl models.
+
+```{code-cell} ipython3
+def model_spectrum(kind):
+    """Observed wavelength and flux density of one of three model sources.
+
+    Parameters
+    ----------
+    kind : {'galaxy at z = 7', 'red galaxy at z = 2.3', 'brown dwarf (1200 K)'}
+        The model source.
+
+    Returns
+    -------
+    wavelength : numpy.ndarray
+        Observed wavelength in μm.
+    flux : numpy.ndarray
+        Flux density per unit frequency, with a value of 1 at 1.77 μm (the H band).
+    """
+    with contextlib.redirect_stdout(io.StringIO()), warnings.catch_warnings():
+        warnings.simplefilter('ignore')
+        if kind == 'brown dwarf (1200 K)':
+            stars = eazy.templates.load_phoenix_stars(add_carbon_star=False, sonora_dwarfs=False)
+            template = next(star for star in stars if star.name.startswith('bt-settl_t01200'))
+            wavelength, flux = template.wave, np.squeeze(template.flux_fnu())
+        else:
+            name, redshift = {'galaxy at z = 7': ('corr_sfhz_13_bin0_av0.01.fits', 7.0),
+                              'red galaxy at z = 2.3': ('corr_sfhz_13_bin2_av0.50.fits', 2.3)}[kind]
+            template = eazy.templates.Template(file=os.path.join(eazy.utils.DATA_PATH, 'templates/sfhz', name))
+            wavelength = template.wave * (1 + redshift)
+            # Absorption by the intergalactic medium blueward of Lyman-alpha.
+            flux = np.squeeze(template.flux_fnu(z=redshift)) * eazy.igm.Inoue14().full_IGM(redshift, wavelength)
+    wavelength = wavelength / 1e4  # Angstrom to micron
+    return wavelength, flux / np.interp(1.77, wavelength, flux)
+```
+
+```{code-cell} ipython3
+filter_file = eazy.filters.FilterFile(os.path.join(eazy.utils.DATA_PATH, 'filters', 'FILTER.RES.latest'))
+# EAZY filter numbers and labels of the bands of this notebook. Filters 18 and 19 are IRAC channels 1 and 2.
+PLOT_FILTERS = {314: 'g', 315: 'r', 316: 'i', 317: 'z', 410: '$I_E$', 411: '$Y_E$', 412: '$J_E$', 413: '$H_E$',
+                18: '3.6 μm', 19: '4.5 μm'}
+
+fig, ax = plt.subplots(figsize=(11, 4.8))
+for kind, color in [('galaxy at z = 7', 'crimson'), ('red galaxy at z = 2.3', 'tab:orange'),
+                    ('brown dwarf (1200 K)', 'tab:blue')]:
+    wavelength, flux = model_spectrum(kind)
+    ax.plot(wavelength, flux, color=color, linewidth=1, label=kind)
+
+# Filter curves at the bottom of the figure, each scaled to the same height.
+for number, label in PLOT_FILTERS.items():
+    filter_curve = filter_file[number]
+    wavelength, throughput = filter_curve.wave / 1e4, filter_curve.throughput / filter_curve.throughput.max()
+    is_euclid = number >= 410
+    ax.fill_between(wavelength, 2e-3, 2e-3 * 10**(0.9 * throughput), color='0.3' if is_euclid else '0.75',
+                    alpha=0.5, linewidth=0)
+    ax.text(filter_curve.pivot / 1e4, 2.2e-2 if is_euclid else 1.3e-3, label, ha='center', fontsize=8)
+ax.set_xscale('log')
+ax.set_yscale('log')
+ax.set_xlim(0.38, 5.5)
+ax.set_ylim(1e-3, 30)
+ax.set_xticks([0.5, 1, 2, 4], ['0.5', '1', '2', '4'])
+ax.set_xlabel('observed wavelength (μm)')
+ax.set_ylabel('flux density, relative to $H_E$')
+ax.legend(frameon=False, loc='upper left')
+plt.show()
+```
+
+**Figure 1.** Model spectra of a young galaxy at z = 7 (red), an old and dusty galaxy at z = 2.3 (orange) and a brown dwarf (blue), all with the same flux in $H_E$.
+The shaded curves at the bottom are the filters: the Euclid bands in dark gray, and the HSC bands ($g$, $r$, $i$, $z$) and the IRAC channels in light gray.
+The galaxy at z = 7 has no flux blueward of 1 μm, and a flat spectrum with emission lines redward of it.
+The other two are also a hundred times fainter in $I_E$ and in the optical than in $H_E$, so with noisy data they can pass as dropouts.
+The two galaxies differ most at 3.6 and 4.5 μm: the red galaxy is several times brighter there than in $H_E$, and the galaxy at z = 7 is a little fainter.
+This is why the IRAC bands matter in Section 6.
+The brown dwarf differs in the shape of its spectrum, which has deep molecular absorption bands between the peaks in $Y_E$, $J_E$ and $H_E$; the model is coarsely sampled beyond 2.5 μm, which gives the straight segments there.
+
 ## Science choices
 
 The cuts below follow Allen et al. (2026).
@@ -331,6 +420,39 @@ snr = {band: values[good_flags & not_in_optical] for band, values in snr.items()
 print(f'{len(sample)} sources are also not detected in HSC g, r and i')
 ```
 
+We look at the sample before fitting it: how bright the sources are, and how strong their breaks are.
+The strength of the break is the color $I_E - H_E$.
+The sources are not detected in $I_E$, so we use the 2σ upper limit on their $I_E$ flux, which gives a lower limit on the color.
+
+```{code-cell} ipython3
+mag_h_all = abmag(dropouts['flux_h_2fwhm_aper'])
+mag_h_sample = abmag(sample['flux_h_2fwhm_aper'])
+# 2 sigma limit on the I_E magnitude, and the lower limit on the color I_E - H_E.
+limit_vis = abmag(SNR_NOT_DETECTED * as_float_array(sample['fluxerr_vis_2fwhm_aper']))
+break_limit = limit_vis - mag_h_sample
+
+fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
+bins = np.arange(21.5, 25.75, 0.25)
+axes[0].hist(mag_h_all, bins=bins, color='0.85', label=f'detected in J and H, not in $I_E$ ({len(dropouts)})')
+axes[0].hist(mag_h_all[good_flags], bins=bins, color='0.6', label=f'good flags ({good_flags.sum()})')
+axes[0].hist(mag_h_sample, bins=bins, color='crimson', label=f'not detected in HSC g, r, i ({len(sample)})')
+axes[0].set_xlabel('$H_E$ magnitude (AB, 2 FWHM aperture)')
+axes[0].set_ylabel('number of sources')
+axes[0].legend(frameon=False, fontsize=8, loc='upper left')
+
+axes[1].scatter(mag_h_sample, break_limit, marker='^', s=22, color='crimson')
+axes[1].set_xlabel('$H_E$ magnitude (AB, 2 FWHM aperture)')
+axes[1].set_ylabel('lower limit on $I_E - H_E$ (mag)')
+fig.tight_layout()
+plt.show()
+```
+
+**Figure 2.** The sample before the SED fits.
+Left: $H_E$ magnitudes of the sources after each cut.
+Right: lower limit on the color $I_E - H_E$ of the sources of the final sample, from the 2σ upper limit on their $I_E$ flux.
+The limit on the break follows the $H_E$ magnitude, because the depth of the $I_E$ image is almost the same for all sources: the break is only known to be stronger than about 2.5 magnitudes for the faintest sources, and stronger than 4 magnitudes for the brightest.
+The cut on the HSC bands removes more than half of the sources with good flags: they have some optical flux, so they are not at z > 6.
+
 ## 3. Fit the SEDs with EAZY
 
 [EAZY](https://github.com/gbrammer/eazy-py) fits a combination of galaxy templates to the photometry of each source, on a grid of redshifts.
@@ -343,17 +465,6 @@ We use the same settings as Allen et al. (2026):
 
 One setting is different: our redshift grid has steps of 0.01 × (1 + z), the default of EAZY, and theirs has steps of 0.01.
 The wider steps at high redshift make the fit five times faster.
-
-EAZY keeps its templates and filter curves in the directory of its Python package, and downloads them from GitHub if they are not there.
-
-```{code-cell} ipython3
-if not os.path.exists(os.path.join(eazy.utils.DATA_PATH, 'templates')):
-    eazy.fetch_eazy_photoz()
-    eazy.set_data_path()
-
-# EAZY writes and reads its input catalog here.
-os.makedirs('output', exist_ok=True)
-```
 
 The next function writes the fluxes in the format EAZY reads, and runs the fit.
 After the galaxy fit it fits templates of stars to the same photometry, at redshift 0.
@@ -503,7 +614,7 @@ Our aperture magnitudes are also fainter than total magnitudes, which makes the 
 So most of the candidates are not galaxies at z > 6.
 The rest of the notebook looks at what they can be.
 
-The first figure shows what the fits found for all sources of the sample.
+The next figure shows what the fits found for all sources of the sample.
 
 ```{code-cell} ipython3
 candidates = sample[sample['candidate']]
@@ -539,7 +650,7 @@ fig.tight_layout()
 plt.show()
 ```
 
-**Figure 1.** Results of the SED fits.
+**Figure 3.** Results of the SED fits.
 Left: best-fit redshift of all sources of the sample (gray) and of the candidates (red); the dashed line is the redshift cut.
 Middle: $\chi^2$ of the best star template against the $\chi^2$ of the best galaxy fit, for the sources with a best-fit redshift of at least 6; sources below the dashed line are better fit by a star and are rejected.
 Right: $H_E$ magnitude and redshift of the candidates.
@@ -594,10 +705,13 @@ for label, group, color in groups:
         ax.scatter(sample['Y-J'][shown], sample['z-Y'][shown], s=18, marker=marker, color=color,
                    label=None if is_limit else label)
 
-# The color cuts: the selected region is above the lines.
+# The color cuts: the selected region is above the lower boundary and left of Y - J = 0.5.
 y_minus_j = np.array([-1.5, 0.035, 0.5])
-ax.plot(y_minus_j, np.maximum(1.14, 4 * y_minus_j + 1), color='black', linewidth=1)
+lower_boundary = np.maximum(1.14, 4 * y_minus_j + 1)
+ax.fill_between(y_minus_j, lower_boundary, 6, color='gold', alpha=0.25, linewidth=0)
+ax.plot(y_minus_j, lower_boundary, color='black', linewidth=1)
 ax.plot([0.5, 0.5], [3, 6], color='black', linewidth=1)
+ax.text(-1.4, 4.75, 'color selection of z = 6 to 8 galaxies\n(Allen et al. 2026)', va='top', fontsize=9)
 ax.set_xlim(-1.5, 2.5)
 ax.set_ylim(-1, 5)
 ax.set_xlabel('$Y_E - J_E$ (mag)')
@@ -606,9 +720,9 @@ ax.legend(frameon=False, loc='lower right')
 plt.show()
 ```
 
-**Figure 2.** Colors of the sources with S/N > 2 in $Y_E$.
+**Figure 4.** Colors of the sources with S/N > 2 in $Y_E$.
 Triangles are lower limits on $z - Y_E$, for sources that are not detected in the HSC $z$ band.
-The black lines are the color cuts of Allen et al. (2026) for galaxies at z = 6 to 8: the selected region is above and to the left of the lines.
+The shaded region is the color selection of Allen et al. (2026) for galaxies at z = 6 to 8: a strong break ($z - Y_E$, vertical axis) and a blue color redward of it ($Y_E - J_E$, horizontal axis).
 
 No source of our small field passes the color cuts.
 The SED candidates are outside the selected region because they are red in $Y_E - J_E$.
@@ -802,7 +916,7 @@ for row_index, (row, field) in enumerate(zip(followup, fields)):
 plt.show()
 ```
 
-**Figure 3.** The candidates that were followed up, one per row.
+**Figure 5.** The candidates that were followed up, one per row.
 Left: stamps of 8 arcsec in the Euclid bands and in IRAC channels 1 and 2, centered on the candidate.
 Middle: the photometry used in the fit with IRAC (black points; arrows are 2σ upper limits), with the best galaxy fit to the catalog bands (blue) and to the catalog bands and IRAC (red). The open squares are the fluxes of each fit in the bands.
 Right: p(z) of the two fits, in the same colors.
