@@ -17,7 +17,7 @@ authors:
 
 ## Overview
 
-- Select bright galaxy candidates at redshift z > 6 in a Euclid Deep Field, from the Euclid DR1 MER catalog queried with IRSA's TAP service.
+- Select bright galaxy candidates at redshift z > 6 in a Euclid Deep Field, from the Euclid DR1 MER catalog, read from IRSA's Parquet files in the cloud.
 - Fit galaxy and brown dwarf templates to their photometry with EAZY, and keep the sources that are best fit by a galaxy at z ≥ 6.
 - Inspect the images of a few candidates and add Spitzer/IRAC fluxes with forced photometry, to see how the mid-infrared changes their redshifts.
 
@@ -48,33 +48,33 @@ The result is a list of candidates, not a sample for science: the last section l
 - The Euclid DR1 MER mosaics and the Cosmic Dawn Survey Spitzer/IRAC mosaics, for the image stamps and the forced photometry of a few candidates.
 
 Euclid observes three Euclid Deep Fields: North (EDF-N), South (EDF-S), and Fornax (EDF-F).
-We use a circle of 0.5 degree radius (0.8 square degrees) in EDF-N, the field with deep HSC data in DR1.
+We use a circle of 0.25 degree radius (0.2 square degrees) in EDF-N, the field with deep HSC data in DR1.
 
-**Data access.** The catalog is queried with IRSA's TAP service.
-The images are read by the `euclid_phot` package ([Euclid forced photometry](https://github.com/Caltech-IPAC/euclid-forced-photometry)), which downloads small cutouts from IRSA and keeps them in a local cache.
+**Data access.** The catalog is read from the HATS Parquet files that IRSA keeps in an AWS S3 bucket. Access is free and needs no account. The selected rows are saved to a local file, so they are downloaded only once.
+The images are read by the `euclid_phot` package of the [Euclid forced photometry](forced_photometry/README.md) notebooks, which downloads small cutouts from IRSA and keeps them in a local cache.
 EAZY downloads its templates and filter curves (about 200 MB) the first time it is used.
 
 **Workflow.** The notebook has these sections:
-1. Query the $I_E$ dropouts.
+1. Get the $I_E$ dropouts from the catalog.
 2. Remove flagged sources and sources detected in the optical.
 3. Fit the SEDs with EAZY.
 4. Select the z ≥ 6 candidates.
 5. Compare with a color selection.
 6. Inspect the candidates and add IRAC with forced photometry.
 
-**Runtime.** About 10 minutes, and a few minutes more the first time, when EAZY and `euclid_phot` download their files. Most of the time is spent in the catalog query of Section 1 and in the forced photometry of Section 6.
+**Runtime.** About 10 minutes, and a few minutes more the first time, when EAZY and `euclid_phot` download their files. Most of the time is spent in the SED fits of Sections 3 and 6 and in the forced photometry of Section 6.
 
 ## Imports
 
-`euclid_phot` and its dependency Tractor are not on PyPI: the first three commented lines install them from the package repository.
+`euclid_phot` and its dependency Tractor are not on PyPI.
+The package is in the `forced_photometry` directory next to this notebook, and its install script installs both: uncomment the first two lines, and restart the kernel when the install has finished.
 EAZY prints a message that it failed to import `dust_attenuation` each time it is loaded. This optional dependency is not used in this notebook, and the message can be ignored.
 
 ```{code-cell} ipython3
 # Uncomment the next lines to install dependencies if needed.
-# !git clone https://github.com/Caltech-IPAC/euclid-forced-photometry.git
-# !git -C euclid-forced-photometry checkout 7a09d11
-# !bash euclid-forced-photometry/scripts/install.sh
-# %pip install numpy==2.4.6 matplotlib==3.10.5 astropy==7.2.0 pyvo==1.9.0 eazy==0.8.7
+# import sys
+# !bash forced_photometry/scripts/install.sh --python "{sys.executable}"
+# %pip install numpy==2.4.6 matplotlib==3.10.5 astropy==7.2.0 pyarrow==24.0.0 astropy-healpix==1.1.3 eazy==0.8.7
 ```
 
 ```{code-cell} ipython3
@@ -89,8 +89,14 @@ import eazy.photoz
 import euclid_phot as ep
 import matplotlib.pyplot as plt
 import numpy as np
-import pyvo
-from astropy.table import Table
+import pyarrow as pa
+import pyarrow.compute as pc
+import pyarrow.dataset
+import pyarrow.fs
+from astropy import units as u
+from astropy.coordinates import SkyCoord
+from astropy.table import Table, join
+from astropy_healpix import HEALPix
 
 # The helper functions of this notebook are in code_src/euclid_highz_selection.py.
 sys.path.append('code_src')
@@ -113,7 +119,7 @@ We leave $Y_E$ free, so that the selection starts at z = 6.
 
 ```{code-cell} ipython3
 # Center (degrees) and radius (degrees) of the search circle in EDF-N.
-FIELD_RA, FIELD_DEC, FIELD_RADIUS = 269.73, 66.02, 0.5
+FIELD_RA, FIELD_DEC, FIELD_RADIUS = 269.73, 66.02, 0.25
 
 SNR_DETECTED = 5.0      # minimum S/N in J and in H
 SNR_NOT_DETECTED = 2.0  # maximum S/N in the bands blueward of the break
@@ -136,56 +142,147 @@ They are not total fluxes.
 For each band we list the catalog table that has it, and the number of its filter curve in the filter file of EAZY.
 
 ```{code-cell} ipython3
-# band name in the catalog columns: (table alias in the query, EAZY filter number, label)
+# band name in the catalog columns: (catalog that has the band, EAZY filter number, label)
 BANDS = {
-    'g_ext_hsc': ('m', 314, 'HSC g'),
-    'r_ext_hsc': ('p', 315, 'HSC r'),
-    'i2_ext_hsc': ('p', 316, 'HSC i'),
-    'z_ext_hsc': ('m', 317, 'HSC z'),
-    'vis': ('m', 410, '$I_E$'),
-    'y': ('m', 411, '$Y_E$'),
-    'j': ('m', 412, '$J_E$'),
-    'h': ('m', 413, '$H_E$'),
+    'g_ext_hsc': ('main', 314, 'HSC g'),
+    'r_ext_hsc': ('photometry', 315, 'HSC r'),
+    'i2_ext_hsc': ('photometry', 316, 'HSC i'),
+    'z_ext_hsc': ('main', 317, 'HSC z'),
+    'vis': ('main', 410, '$I_E$'),
+    'y': ('main', 411, '$Y_E$'),
+    'j': ('main', 412, '$J_E$'),
+    'h': ('main', 413, '$H_E$'),
 }
 # The bands that are entirely blueward of the Lyman-alpha break at z >= 6.
 BLUE_BANDS = ['g_ext_hsc', 'r_ext_hsc', 'i2_ext_hsc', 'vis']
 ```
 
-## 1. Query the $I_E$ dropouts
+## 1. Get the $I_E$ dropouts from the catalog
 
 The DR1 MER catalog of the Euclid Deep Survey is in two tables that share the `object_id` column.
-`euclid_dr1_mer_catalogue_deep_survey` has the positions, the flags, and the photometry in the Euclid bands and in a first set of ground-based bands.
-`euclid_dr1_mer_catalogue_deep_survey_photometry` has the photometry in the other external bands.
-In EDF-N the HSC $g$ and $z$ fluxes are in the first table, and the HSC $r$ and $i$ fluxes in the second, so we join the two.
+`mer_catalogue_deep_survey` has the positions, the flags, and the photometry in the Euclid bands and in a first set of ground-based bands.
+`mer_catalogue_deep_survey_photometry` has the photometry in the other external bands.
+In EDF-N the HSC $g$ and $z$ fluxes are in the first table, and the HSC $r$ and $i$ fluxes in the second, so we need both.
+
+IRSA serves these tables in two ways: with its TAP service, and as [HATS](https://hats.readthedocs.io/) catalogs, which are sets of Parquet files in an AWS S3 bucket.
+We read the Parquet files directly.
+This needs no service to run the search, and takes less than a minute for our circle.
+The IRSA tutorial [Euclid DR1 HATS Catalogs: Introduction](https://caltech-ipac.github.io/irsa-tutorials/euclid-dr1-hats-intro/) describes the catalogs and other ways to read them.
 
 ```{code-cell} ipython3
-tap = pyvo.dal.TAPService('https://irsa.ipac.caltech.edu/TAP')
-
-MER_TABLE = 'euclid_dr1_mer_catalogue_deep_survey'
-MER_PHOTOMETRY_TABLE = 'euclid_dr1_mer_catalogue_deep_survey_photometry'
-
-# Positions, the flag for a detection in the VIS image, the quality flags and the Galactic reddening.
-columns = ['m.object_id', 'm.ra', 'm.dec', 'm.vis_det', 'm.spurious_flag', 'm.det_quality_flag',
-           'm.flag_y', 'm.flag_j', 'm.flag_h', 'm.gal_ebv']
-# The aperture flux and its uncertainty in each band.
-for band, (alias, _, _) in BANDS.items():
-    columns += [f'{alias}.flux_{band}_2fwhm_aper', f'{alias}.fluxerr_{band}_2fwhm_aper']
+s3 = pyarrow.fs.S3FileSystem(anonymous=True, region='us-east-1')
+HATS_PREFIX = 'nasa-irsa-euclid-dr1/contributed/dr1/hats/reformatted_catalogs'
+MAIN_CATALOG = 'mer_catalogue_deep_survey'
+PHOTOMETRY_CATALOG = 'mer_catalogue_deep_survey_photometry'
 ```
 
-The signal-to-noise cuts are part of the query, so the service returns a few hundred rows instead of the 600,000 sources in the circle.
+A HATS catalog is split into files by position on the sky: each file has the sources of one HEALPix pixel (a partition), and the rows carry the index of the smaller HEALPix pixel of order 9 they are in (`_healpix_9`, pixels of about 0.1 degree).
+To read a circle on the sky we therefore:
+
+- list the order 9 pixels that overlap the circle;
+- open only the partitions that contain these pixels;
+- ask for the rows with one of these pixel indices, and with any other condition we have. PyArrow applies these conditions while it reads, so only the matching rows are downloaded.
+
+The pixels cover a little more than the circle, so the exact cut on the distance from the center is done after reading.
+
+```{code-cell} ipython3
+def read_hats_circle(catalog, columns, ra, dec, radius, condition=None):
+    """Read the rows of an IRSA Euclid DR1 HATS catalog that are in the HEALPix pixels overlapping a circle.
+
+    Parameters
+    ----------
+    catalog : str
+        Name of the catalog, for example ``'mer_catalogue_deep_survey'``.
+    columns : list of str
+        Columns to read.
+    ra, dec, radius : float
+        Center and radius of the circle in degrees.
+    condition : pyarrow.compute.Expression, optional
+        Extra condition on the rows.
+
+    Returns
+    -------
+    astropy.table.Table
+        The requested columns of the matching rows. Some rows are outside the circle, by up to about 0.3 degree.
+    """
+    catalog_path = f'{HATS_PREFIX}/{catalog}/euclid_dr1_reformatted_catalogs_{catalog}-hats'
+
+    # Order 9 pixels (nested numbering) that overlap the circle. The margin of 0.1 degree is for the
+    # sources close to the edge of a pixel.
+    healpix = HEALPix(nside=2**9, order='nested')
+    pixels = np.unique(healpix.cone_search_lonlat(ra * u.deg, dec * u.deg, (radius + 0.1) * u.deg))
+    row_filter = pc.field('_healpix_9').isin(pa.array(pixels, pa.int64()))
+
+    # Partitions that contain these pixels. In the nested numbering, the pixel of order n that contains
+    # a pixel of order 9 is its index divided by 4**(9 - n).
+    with s3.open_input_stream(f'{catalog_path}/partition_info.csv') as partition_file:
+        partitions = Table.read(partition_file.read().decode(), format='ascii.csv')
+    partition_filter = None
+    for order, pixel in zip(partitions['Norder'], partitions['Npix']):
+        if np.any(pixels // 4**(9 - order) == pixel):
+            this_partition = (pc.field('Norder') == int(order)) & (pc.field('Npix') == int(pixel))
+            partition_filter = this_partition if partition_filter is None else partition_filter | this_partition
+    row_filter = row_filter & partition_filter
+    if condition is not None:
+        row_filter = row_filter & condition
+
+    dataset = pyarrow.dataset.dataset(f'{catalog_path}/dataset', partitioning='hive', filesystem=s3,
+                                      ignore_prefixes=['_', '.'])
+    return Table.from_pandas(dataset.to_table(columns=columns, filter=row_filter).to_pandas())
+```
+
+The signal-to-noise cuts are conditions of the read, so we download about a hundred rows instead of all the sources in the circle.
 A cut `flux < 2 * error` in $I_E$ also keeps the sources with a negative $I_E$ flux, which is what we want.
 
 ```{code-cell} ipython3
-query = f"""
-    SELECT {', '.join(columns)}
-    FROM {MER_TABLE} AS m
-    JOIN {MER_PHOTOMETRY_TABLE} AS p ON m.object_id = p.object_id
-    WHERE CONTAINS(POINT('ICRS', m.ra, m.dec), CIRCLE('ICRS', {FIELD_RA}, {FIELD_DEC}, {FIELD_RADIUS})) = 1
-      AND m.flux_j_2fwhm_aper >= {SNR_DETECTED} * m.fluxerr_j_2fwhm_aper
-      AND m.flux_h_2fwhm_aper >= {SNR_DETECTED} * m.fluxerr_h_2fwhm_aper
-      AND m.flux_vis_2fwhm_aper < {SNR_NOT_DETECTED} * m.fluxerr_vis_2fwhm_aper
-    """
-dropouts = tap.run_async(query).to_table()
+def flux_column(band):
+    """PyArrow expressions for the aperture flux of a band and its uncertainty."""
+    return pc.field(f'flux_{band}_2fwhm_aper'), pc.field(f'fluxerr_{band}_2fwhm_aper')
+
+
+flux_j, error_j = flux_column('j')
+flux_h, error_h = flux_column('h')
+flux_vis, error_vis = flux_column('vis')
+dropout_condition = ((flux_j >= pc.multiply(pc.scalar(SNR_DETECTED), error_j))
+                     & (flux_h >= pc.multiply(pc.scalar(SNR_DETECTED), error_h))
+                     & (flux_vis < pc.multiply(pc.scalar(SNR_NOT_DETECTED), error_vis)))
+
+# Positions, the flag for a detection in the VIS image, the quality flags and the Galactic reddening.
+main_columns = ['object_id', 'ra', 'dec', 'vis_det', 'spurious_flag', 'det_quality_flag',
+                'flag_y', 'flag_j', 'flag_h', 'gal_ebv']
+photometry_columns = ['object_id']
+# The aperture flux and its uncertainty in each band.
+for band, (catalog, _, _) in BANDS.items():
+    band_columns = [f'flux_{band}_2fwhm_aper', f'fluxerr_{band}_2fwhm_aper']
+    if catalog == 'main':
+        main_columns += band_columns
+    else:
+        photometry_columns += band_columns
+```
+
+We read the dropouts from the first catalog and keep the ones inside the circle, then read the rows of the same sources from the second catalog and join the two.
+
+The result is saved in the `data` directory and read from there the next time the notebook runs, so a later run does not need the network for this step.
+The file name has the position and the cuts in it: when you change one of them, the catalogs are read again.
+To force a new read, delete the file.
+
+```{code-cell} ipython3
+os.makedirs('data', exist_ok=True)
+dropouts_file = (f'data/highz_dropouts_{FIELD_RA:g}_{FIELD_DEC:g}_{FIELD_RADIUS:g}'
+                 f'_snr{SNR_DETECTED:g}_{SNR_NOT_DETECTED:g}.ecsv')
+if os.path.exists(dropouts_file):
+    dropouts = Table.read(dropouts_file)
+else:
+    dropouts = read_hats_circle(MAIN_CATALOG, main_columns, FIELD_RA, FIELD_DEC, FIELD_RADIUS, dropout_condition)
+    center = SkyCoord(FIELD_RA * u.deg, FIELD_DEC * u.deg)
+    separation = SkyCoord(dropouts['ra'], dropouts['dec'], unit='deg').separation(center)
+    dropouts = dropouts[separation <= FIELD_RADIUS * u.deg]
+
+    same_sources = pc.field('object_id').isin(pa.array(dropouts['object_id']))
+    photometry = read_hats_circle(PHOTOMETRY_CATALOG, photometry_columns, FIELD_RA, FIELD_DEC, FIELD_RADIUS,
+                                  same_sources)
+    dropouts = join(dropouts, photometry, keys='object_id', join_type='left')
+    dropouts.write(dropouts_file)
 print(f'{len(dropouts)} sources detected in J and H and not detected in I_E')
 ```
 
@@ -391,7 +488,7 @@ print(f'{"Galaxy fits better than a star":45s} {(is_high_z & not_a_star).sum():5
 print(f'{f"P(z < {Z_LOW:g}) <= {P_LOW_MAX:g}":45s} {sample["candidate"].sum():5d}')
 ```
 
-About 60 sources pass all cuts.
+About a dozen sources pass all cuts.
 To judge this number we compare it with the number of galaxies that are expected.
 Allen et al. (2026, their Table 3) expect about 270 galaxies at z = 6 to 8 in the 53 square degrees of the Euclid Deep Fields at a depth of 24.5 AB, which is about 5 per square degree.
 
@@ -450,10 +547,10 @@ Right: $H_E$ magnitude and redshift of the candidates.
 The sample has two groups of sources: one best fit at z ≥ 6, and one best fit at z = 1 to 2.5, where the Balmer break of a red galaxy is between the optical and the near-infrared bands.
 For most sources the star and the galaxy templates fit almost equally well (middle), so the comparison of the two $\chi^2$ removes only a few sources.
 The fit has eight bands, and a dropout has flux in three or four of them: this is not enough to tell a cool dwarf from a galaxy at high redshift.
-Many sources have a $\chi^2$ of several tens, which is high for eight bands: neither kind of template describes them, and their photometry should be checked.
-The candidates have $H_E$ magnitudes from about 22.7 to 25.2 (right).
+Several sources have a $\chi^2$ of a few tens or more, which is high for eight bands: neither kind of template describes them, and their photometry should be checked.
+The candidates have $H_E$ magnitudes from about 23.4 to 25.2 (right).
 A galaxy at z ≈ 7 with $H_E$ = 23.5 has an absolute UV magnitude of about −23.5, which is as luminous as the most extreme candidates of Allen et al. (2026).
-The candidates brighter than that are very likely not galaxies at z > 6.
+Finding several candidates within half a magnitude of that, in a fifth of a square degree, is one more sign that most of them are not galaxies at z > 6.
 
 ## 5. Compare with a color selection
 
@@ -513,8 +610,8 @@ plt.show()
 Triangles are lower limits on $z - Y_E$, for sources that are not detected in the HSC $z$ band.
 The black lines are the color cuts of Allen et al. (2026) for galaxies at z = 6 to 8: the selected region is above and to the left of the lines.
 
-Only about ten sources pass the color cuts, and most of them are also SED candidates.
-Most SED candidates are outside the selected region because they are red in $Y_E - J_E$.
+No source of our small field passes the color cuts.
+The SED candidates are outside the selected region because they are red in $Y_E - J_E$.
 This is where brown dwarfs and red galaxies at lower redshift are, and the color cut is made to remove them.
 A red $Y_E - J_E$ color can also be that of a galaxy at z > 7, for which the break is inside the $Y_E$ band, so the color cut removes these too: this is one reason why Allen et al. prefer the SED fit, which uses all bands.
 But the SED fit can only separate the two kinds of sources when it has bands redward of $H_E$, and the catalog has none in this field.
@@ -528,7 +625,7 @@ They also show that Spitzer/IRAC fluxes at 3.6 and 4.5 μm are needed to separat
 The DR1 catalog has no IRAC fluxes in EDF-N.
 We measure them with forced photometry, using the `euclid_phot` package: it fits a model of every source in a small field to the pixels of each image, with the positions and shapes fixed and only the fluxes free.
 Sources that are blended in the IRAC images, which have a PSF of about 2 arcsec, are fit together.
-See the [forced photometry notebooks](https://github.com/Caltech-IPAC/euclid-forced-photometry) for the method.
+See the [forced photometry notebooks](forced_photometry/README.md) for the method.
 
 Two settings matter for dropouts:
 
@@ -607,6 +704,9 @@ for row, field in zip(followup, fields):
         if f'flux_{band}_ujy' in match.colnames:
             row[f'forced_flux_{band}'] = match[f'flux_{band}_ujy'][0]
             row[f'forced_error_{band}'] = match[f'flux_err_{band}_ujy'][0]
+
+if not np.any(np.isfinite(followup['forced_flux_H'])):
+    raise RuntimeError('The forced photometry failed for all candidates: see the messages above.')
 
 print('S/N of the forced fluxes')
 print('object_id            ' + ''.join(f'{band:>8s}' for band in FORCED_BANDS))
@@ -710,9 +810,9 @@ Right: p(z) of the two fits, in the same colors.
 The three sources are real: each is seen in $J_E$ and $H_E$ at the same position and is not an image artifact.
 All three are also bright in IRAC, 1 to 2 magnitudes brighter than in $H_E$, and this changes the fits:
 
-- The source in the second row moves to z ≈ 2.4. The forced photometry also measures flux in $I_E$, which the small aperture of the catalog did not, and the HSC fluxes are all slightly positive. It is a red galaxy at lower redshift.
-- The sources in the first and third rows stay at z = 8 to 9, but the galaxy fits are worse than before, and need a spectrum that rises steeply from $H_E$ to IRAC. Young galaxies at these redshifts are blue. A red galaxy at lower redshift that is too faint for the optical images is a more likely explanation.
-- In the first row, a brighter neighbor is 2 arcsec away. The two are blended in the IRAC images, so the IRAC flux of the candidate depends on how well the model separates them. Allen et al. report a possible contamination of this kind for one of their two Q1 candidates.
+- The source in the second row is isolated. With IRAC its best fit moves to z ≈ 2.4, and only a small part of p(z) stays near z = 9. It is most likely a red galaxy at lower redshift.
+- The source in the third row moves to z ≈ 2.2. Here the forced photometry also measures flux in $I_E$ and $Y_E$ at 7σ, which the small aperture of the catalog did not, so it is not a dropout.
+- The source in the first row stays at z ≈ 8, but the galaxy fit is worse than before and needs a spectrum that rises steeply from $H_E$ to IRAC. Young galaxies at these redshifts are blue. A brighter neighbor is 2 arcsec away, and the two are blended in the IRAC images, so the IRAC flux of the candidate depends on how well the model separates them. Allen et al. report a possible contamination of this kind for one of their two Q1 candidates.
 
 The star templates fit none of the three once IRAC is included ($\chi^2_{\rm star}$ of several hundred in the table above), so they are not brown dwarfs.
 None of the three is a convincing z > 6 galaxy.
@@ -720,8 +820,8 @@ We chose them for their high redshifts, where contaminants are a larger fraction
 
 ## Summary
 
-- One query of the DR1 MER catalog returns the sources in 0.8 square degrees of EDF-N that are detected in $J_E$ and $H_E$ and not in $I_E$. The catalog has the Euclid and HSC fluxes in matched apertures, which is what an SED fit needs.
-- Of about 460 such sources, about 60 are not detected in the optical, are best fit by a galaxy at z ≥ 6, and are fit worse by a star.
+- The DR1 MER catalog can be read directly from Parquet files in the cloud. In less than a minute this gives the sources in 0.2 square degrees of EDF-N that are detected in $J_E$ and $H_E$ and not in $I_E$. The catalog has the Euclid and HSC fluxes in matched apertures, which is what an SED fit needs.
+- Of about 120 such sources, about a dozen are not detected in the optical, are best fit by a galaxy at z ≥ 6, and are fit worse by a star.
 - This is several times more than the number of z > 6 galaxies expected at these magnitudes. With the Euclid and optical bands only, the fits cannot separate high-redshift galaxies from brown dwarfs and from red galaxies at lower redshift.
 - Forced photometry on the IRAC mosaics adds the two bands that can. For the three candidates we followed up, the IRAC fluxes argue against z > 6.
 
@@ -735,7 +835,7 @@ An analysis like that of Allen et al. (2026) needs in addition:
 - simulations of the completeness and the contamination of the selection, as in the first part of their paper;
 - spectroscopy of the best candidates.
 
-To go further, you can change the search circle (IRAC covers about half of EDF-N), follow up more candidates (`N_FOLLOWUP`), or ask for no detection in $Y_E$ to select z > 8 as Allen et al. did for Q1.
+To go further, you can use a larger search circle (IRAC covers about half of EDF-N), follow up more candidates (`N_FOLLOWUP`), or ask for no detection in $Y_E$ to select z > 8 as Allen et al. did for Q1.
 
 ## References
 
