@@ -19,7 +19,7 @@ authors:
 
 - Select bright galaxy candidates at redshift z > 6 in a Euclid Deep Field, from the Euclid DR1 MER catalog, read from IRSA's Parquet files in the cloud.
 - Fit galaxy and brown dwarf templates to their photometry with EAZY, and keep the sources that are best fit by a galaxy at z ≥ 6.
-- Inspect the images of a few candidates and add Spitzer/IRAC fluxes with forced photometry, to see how the mid-infrared changes their redshifts.
+- Inspect the images of the candidates and add Spitzer/IRAC fluxes with forced photometry, to see how the mid-infrared changes their redshifts, and compare their number with published luminosity functions.
 
 ## Introduction
 
@@ -45,7 +45,7 @@ The result is a list of candidates, not a sample for science: the last section l
 
 **Data used.**
 - The Euclid DR1 MER catalog of the Euclid Deep Survey: fluxes in the Euclid bands and in the ground-based Subaru Hyper Suprime-Cam (HSC) bands $g$, $r$, $i$, $z$.
-- The Euclid DR1 MER mosaics and the Cosmic Dawn Survey Spitzer/IRAC mosaics, for the image stamps and the forced photometry of a few candidates.
+- The Euclid DR1 MER mosaics and the Cosmic Dawn Survey Spitzer/IRAC mosaics, for the image stamps and the forced photometry of the candidates.
 
 Euclid observes three Euclid Deep Fields: North (EDF-N), South (EDF-S), and Fornax (EDF-F).
 We use a circle of 0.25 degree radius (0.2 square degrees) in EDF-N, the field with deep HSC data in DR1.
@@ -61,6 +61,7 @@ EAZY downloads its templates and filter curves (about 200 MB) the first time it 
 4. Select the z ≥ 6 candidates.
 5. Compare with a color selection.
 6. Inspect the candidates and add IRAC with forced photometry.
+7. Compare the number of candidates with the literature.
 
 **Runtime.** About 10 minutes, and a few minutes more the first time, when EAZY and `euclid_phot` download their files. Most of the time is spent in the SED fits of Sections 3 and 6 and in the forced photometry of Section 6.
 
@@ -95,7 +96,8 @@ import pyarrow.dataset
 import pyarrow.fs
 from astropy import units as u
 from astropy.coordinates import SkyCoord
-from astropy.table import Table, join
+from astropy.cosmology import FlatLambdaCDM
+from astropy.table import MaskedColumn, Table, join
 from astropy_healpix import HEALPix
 
 # The helper functions of this notebook are in code_src/euclid_highz_selection.py.
@@ -218,8 +220,7 @@ Z_HIGH = 6.0         # minimum photometric redshift of a candidate
 Z_LOW = 5.0          # a candidate must have little probability below this redshift ...
 P_LOW_MAX = 0.05     # ... at most this much
 
-# Section 6: number of candidates to follow up, side of the forced photometry field and of the stamps (arcsec).
-N_FOLLOWUP = 3
+# Section 6: side of the forced photometry field and of the image stamps (arcsec).
 FOLLOWUP_SIZE = 20.0
 STAMP_SIZE = 8.0
 ```
@@ -744,7 +745,7 @@ See the [forced photometry notebooks](forced_photometry/README.md) for the metho
 Two settings matter for dropouts:
 
 - The source models are built on the $H_E$ image (`prior={'band': 'H', ...}`) and not on the VIS image, the default, because the candidates are not detected in VIS.
-- The source list is the MER catalog (`'objects': 'mer'`), so the neighbors of each candidate are modeled too.
+- The source list is the MER catalog (`'objects': 'mer'`), so the neighbors of each candidate are modeled too. We include the sources that are detected only in the near-infrared.
 
 The IRAC images are the mosaics of the Cosmic Dawn Survey (`mosaic_backend='dawn'`), which cover about half of EDF-N.
 
@@ -757,7 +758,69 @@ Sources outside the field are not modeled, and the IRAC PSF spreads some of thei
 The fluxes in the Euclid bands are the same in both.
 This is accurate enough here, where the question is whether a candidate is one or two magnitudes brighter in IRAC than in $H_E$.
 
-The function tries the fit with IRAC twice, because the archive services sometimes time out, and then without IRAC, for the positions that have no IRAC mosaic.
+`euclid_phot` can get the MER sources of a field itself, with a query to IRSA's TAP service.
+We give it the source list instead (`mer_catalog`), from the same Parquet files as in Section 1, so that this step does not depend on that service either.
+We read the columns that `euclid_phot` uses for all sources of our circle once, and save them in the `data` directory.
+
+```{code-cell} ipython3
+# The columns of the MER catalog that euclid_phot uses to build its source models.
+MODEL_COLUMNS = ['object_id', 'ra', 'dec', 'flux_vis_psf', 'fluxerr_vis_psf', 'flux_vis_sersic', 'fluxerr_vis_sersic',
+                 'flux_h_templfit', 'fluxerr_h_templfit', 'flux_h_sersic', 'fluxerr_h_sersic',
+                 'flux_j_templfit', 'fluxerr_j_templfit', 'flux_j_sersic', 'fluxerr_j_sersic',
+                 'flux_y_templfit', 'fluxerr_y_templfit', 'flux_y_sersic', 'fluxerr_y_sersic',
+                 'flux_detection_total', 'semimajor_axis', 'ellipticity', 'position_angle',
+                 'point_like_prob', 'det_quality_flag', 'gal_ebv', 'gal_ebv_err']
+
+all_sources_file = f'data/highz_all_sources_{FIELD_RA:g}_{FIELD_DEC:g}_{FIELD_RADIUS:g}.fits'
+if os.path.exists(all_sources_file):
+    all_sources = Table.read(all_sources_file)
+else:
+    # A box around the circle, with a margin for the fields of the candidates at its edge.
+    margin = FIELD_RADIUS + FOLLOWUP_SIZE / 3600
+    in_box = ((pc.field('dec') > FIELD_DEC - margin) & (pc.field('dec') < FIELD_DEC + margin)
+              & (pc.field('ra') > FIELD_RA - margin / np.cos(np.radians(FIELD_DEC)))
+              & (pc.field('ra') < FIELD_RA + margin / np.cos(np.radians(FIELD_DEC))))
+    all_sources = read_hats_circle(MAIN_CATALOG, MODEL_COLUMNS, FIELD_RA, FIELD_DEC, margin, in_box)
+    all_sources.write(all_sources_file)
+print(f'{len(all_sources)} MER sources')
+```
+
+The next function selects the sources of one field from this table, and adds the columns that `euclid_phot` expects from its own query.
+DR1 has no Sérsic shape measurements at IRSA yet, so these columns are empty and `euclid_phot` fits the shapes itself.
+
+```{code-cell} ipython3
+def field_catalog(ra, dec):
+    """MER sources in a square field, in the format of the MER query of euclid_phot.
+
+    Parameters
+    ----------
+    ra, dec : float
+        Center of the field in degrees. The side of the field is ``FOLLOWUP_SIZE``.
+
+    Returns
+    -------
+    astropy.table.Table
+        The sources with a positive flux in VIS or in H, brightest in VIS first.
+    """
+    half_size = FOLLOWUP_SIZE / 2 / 3600
+    in_field = ((np.abs(all_sources['dec'] - dec) <= half_size)
+                & (np.abs((all_sources['ra'] - ra) * np.cos(np.radians(dec))) <= half_size))
+    flux_vis = as_float_array(all_sources['flux_vis_psf'])
+    flux_h = as_float_array(all_sources['flux_h_templfit'])
+    sources = all_sources[in_field & ((flux_vis > 0) | (flux_h > 0))]
+    sources = sources[np.argsort(-np.nan_to_num(as_float_array(sources['flux_vis_psf'])))]
+
+    # Sersic shape columns, all masked.
+    for name, unit in [('sersic_sersic_vis_radius', 'arcsec'), ('sersic_sersic_vis_index', None),
+                       ('sersic_sersic_vis_axis_ratio', None), ('sersic_angle', 'deg')]:
+        sources[name] = MaskedColumn(np.zeros(len(sources)), mask=np.ones(len(sources), dtype=bool), unit=unit)
+    # euclid_phot models the sources with a high point-like probability as stars.
+    sources['is_star'] = np.nan_to_num(as_float_array(sources['point_like_prob'])) > 0.96
+    return sources
+```
+
+The function below runs the fit.
+It tries the fit with IRAC twice, because the image services sometimes time out, and then without IRAC, for the positions that have no IRAC mosaic.
 
 ```{code-cell} ipython3
 def measure_field(ra, dec):
@@ -782,17 +845,18 @@ def measure_field(ra, dec):
             with warnings.catch_warnings():
                 warnings.simplefilter('ignore')
                 return ep.run_forced_photometry(ra, dec, FOLLOWUP_SIZE, prior={'band': 'H', 'objects': 'mer'},
-                                                n_workers=4, verbose=False, **attempt)
+                                                mer_catalog=field_catalog(ra, dec), n_workers=4, verbose=False,
+                                                **attempt)
         except Exception as error:
             print(f"Fit at ({ra:.4f}, {dec:.4f}) with bands {attempt['target_bands']} failed: {error}")
     return None
 ```
 
-Each field takes about half a minute. We follow up `N_FOLLOWUP` candidates: the ones at the highest redshifts.
-Increase `N_FOLLOWUP` to look at more.
+Each field takes about half a minute the first time, and a few seconds when its images are in the local cache.
+We follow up all candidates, ordered by redshift.
 
 ```{code-cell} ipython3
-followup = candidates[np.argsort(candidates['z_phot'])[::-1][:N_FOLLOWUP]]
+followup = candidates[np.argsort(candidates['z_phot'])[::-1]]
 followup['object_id', 'ra', 'dec', 'z_phot', 'mag_h', 'chi2_galaxy', 'chi2_star'].pprint_all()
 
 fields = [measure_field(source['ra'], source['dec']) for source in followup]
@@ -866,6 +930,24 @@ for index, row in enumerate(followup):
           f"{with_irac['chi2_star']:10.1f} {with_irac['p_low']:7.2f}")
 ```
 
+Now we apply the cuts of Section 4 to the fits with IRAC.
+We do not add a cut on the forced $I_E$ flux, although the forced photometry detects several candidates in $I_E$ (it uses all the pixels of the source model, so it is more sensitive than the small aperture of the catalog).
+The $I_E$ band extends to 0.9 μm, so a galaxy at z = 6 to 6.4 has some flux in it, and the SED fit takes this into account.
+
+```{code-cell} ipython3
+followup['z_phot_irac'] = results_irac['z_phot']
+followup['has_irac'] = np.isfinite(followup['forced_flux_IRAC1'])
+followup['confirmed'] = ((results_irac['z_phot'] >= Z_HIGH)
+                         & (results_irac['chi2_star'] > results_irac['chi2_galaxy'])
+                         & (results_irac['p_low'] <= P_LOW_MAX))
+# Total H magnitude, from the forced photometry.
+followup['mag_h_total'] = abmag(followup['forced_flux_H'])
+
+print(f"{followup['has_irac'].sum()} of {len(followup)} candidates have IRAC photometry")
+print(f"{followup['confirmed'].sum()} of {len(followup)} candidates still pass all cuts:")
+print(followup['object_id', 'z_phot', 'z_phot_irac', 'mag_h_total'][followup['confirmed']])
+```
+
 For each candidate we plot image stamps in the Euclid and IRAC bands, the two SED fits, and the two p(z).
 
 ```{code-cell} ipython3
@@ -873,7 +955,7 @@ pdf_catalog = redshift_pdf(fit.lnp, fit.zgrid)
 pdf_irac = redshift_pdf(fit_irac.lnp, fit_irac.zgrid)
 stamp_labels = {'VIS': '$I_E$', 'Y': '$Y_E$', 'J': '$J_E$', 'H': '$H_E$', 'IRAC1': '3.6 μm', 'IRAC2': '4.5 μm'}
 
-fig = plt.figure(figsize=(17, 3.1 * len(followup)), layout='constrained')
+fig = plt.figure(figsize=(17, 2.7 * len(followup)), layout='constrained')
 grid = fig.add_gridspec(len(followup), 10, width_ratios=[1] * 6 + [0.25, 3.2, 0.15, 2])
 for row_index, (row, field) in enumerate(zip(followup, fields)):
     # Image stamps. A band that was not measured is left empty.
@@ -886,7 +968,7 @@ for row_index, (row, field) in enumerate(zip(followup, fields)):
             continue
         show_stamp(ax, images['data'], images['wcs'], row['ra'], row['dec'], STAMP_SIZE, stamp_labels[band])
         if column == 0:
-            ax.set_ylabel(f"{row['object_id']}", fontsize=8)
+            ax.set_ylabel(f"{row['object_id']}", fontsize=8, color='crimson' if row['confirmed'] else 'black')
 
     # SEDs: the catalog fit (blue) and the fit with IRAC (red, with its photometry).
     ax = fig.add_subplot(grid[row_index, 7])
@@ -916,40 +998,161 @@ for row_index, (row, field) in enumerate(zip(followup, fields)):
 plt.show()
 ```
 
-**Figure 5.** The candidates that were followed up, one per row.
+**Figure 5.** The candidates, one per row, from the highest to the lowest redshift of the first fit.
+The object ID at the left is red for the candidates that still pass all cuts with IRAC.
 Left: stamps of 8 arcsec in the Euclid bands and in IRAC channels 1 and 2, centered on the candidate.
 Middle: the photometry used in the fit with IRAC (black points; arrows are 2σ upper limits), with the best galaxy fit to the catalog bands (blue) and to the catalog bands and IRAC (red). The open squares are the fluxes of each fit in the bands.
 Right: p(z) of the two fits, in the same colors.
 
-The three sources are real: each is seen in $J_E$ and $H_E$ at the same position and is not an image artifact.
-All three are also bright in IRAC, 1 to 2 magnitudes brighter than in $H_E$, and this changes the fits:
+All the sources are real: each is seen in $J_E$ and $H_E$ at the same position, and none is an image artifact.
+The fits with IRAC divide them into three groups:
 
-- The source in the second row is isolated. With IRAC its best fit moves to z ≈ 2.4, and only a small part of p(z) stays near z = 9. It is most likely a red galaxy at lower redshift.
-- The source in the third row moves to z ≈ 2.2. Here the forced photometry also measures flux in $I_E$ and $Y_E$ at 7σ, which the small aperture of the catalog did not, so it is not a dropout.
-- The source in the first row stays at z ≈ 8, but the galaxy fit is worse than before and needs a spectrum that rises steeply from $H_E$ to IRAC. Young galaxies at these redshifts are blue. A brighter neighbor is 2 arcsec away, and the two are blended in the IRAC images, so the IRAC flux of the candidate depends on how well the model separates them. Allen et al. report a possible contamination of this kind for one of their two Q1 candidates.
+- Eight candidates move to z = 1.4 to 2.5. They are 1 to 2 magnitudes brighter in IRAC than in $H_E$, like the red galaxy of Figure 1, and the forced photometry measures some flux in $I_E$ or in the optical for most of them. They are red galaxies at lower redshift.
+- Two candidates (rows 8 and 9) are faint or not detected in IRAC and keep a redshift above 6, but with IRAC a star template fits them better than a galaxy. Neither template fits well. A cool star is fainter at 3.6 and 4.5 μm than in $H_E$, as these sources are, so they are probably stars or brown dwarfs.
+- Two candidates still pass all cuts. The one in the last row, at z ≈ 6.2, has a flat spectrum from $Y_E$ to IRAC, as expected for a young galaxy (Figure 1), and is the most convincing candidate of the field. The one in the first row, at z ≈ 7.7, is 2 magnitudes brighter in IRAC than in $H_E$, which is not expected for a young galaxy. A brighter neighbor is 2 arcsec away and the two are blended in the IRAC images, so its IRAC flux depends on how well the model separates them; Allen et al. report a possible contamination of this kind for one of their two Q1 candidates.
 
-The star templates fit none of the three once IRAC is included ($\chi^2_{\rm star}$ of several hundred in the table above), so they are not brown dwarfs.
-None of the three is a convincing z > 6 galaxy.
-We chose them for their high redshifts, where contaminants are a larger fraction of the candidates, so this does not mean that all candidates are contaminants.
+So with IRAC, 10 of the 12 candidates are no longer candidates, and one of the two that are left is doubtful.
+
+## 7. Compare the number of candidates with the literature
+
+How many galaxies at z > 6 should we find in this area at this depth?
+The answer comes from the UV luminosity function, the number of galaxies per unit volume and per unit absolute magnitude, which has been measured at these redshifts with Hubble and ground-based surveys.
+We use two published fits:
+
+- the Schechter functions of Bouwens et al. (2021, their Table 5) at z ≈ 6, 7, 8 and 9, which we interpolate in redshift;
+- the double power law of Bowler et al. (2020, their Equation 1), which has more galaxies at the bright end than a Schechter function. This is the kind of model that Allen et al. (2026) use for their forecasts.
+
+The expected number of galaxies brighter than an apparent magnitude $m$ is the integral of the luminosity function over the volume of our field and over the absolute magnitudes brighter than $M = m - \mu(z) + 2.5 \log_{10}(1 + z)$, where $\mu$ is the distance modulus.
+This relation assumes a spectrum that is flat in flux density per unit frequency, which is close to the spectrum of a young galaxy (Figure 1).
+
+```{code-cell} ipython3
+cosmology = FlatLambdaCDM(H0=70, Om0=0.3)
+
+
+def schechter_bouwens(magnitude, redshift):
+    """UV luminosity function of Bouwens et al. (2021), in galaxies per mag per Mpc^3."""
+    # Schechter parameters of their Table 5, interpolated in redshift.
+    table_z = [5.9, 6.8, 7.9, 8.9]
+    m_star = np.interp(redshift, table_z, [-20.93, -21.15, -20.93, -21.15])
+    phi_star = 10**np.interp(redshift, table_z, np.log10([0.51e-3, 0.19e-3, 0.09e-3, 0.021e-3]))
+    alpha = np.interp(redshift, table_z, [-1.93, -2.06, -2.23, -2.33])
+    luminosity = 10**(-0.4 * (magnitude - m_star))
+    return 0.4 * np.log(10) * phi_star * luminosity**(alpha + 1) * np.exp(-luminosity)
+
+
+def double_power_law_bowler(magnitude, redshift):
+    """UV luminosity function of Bowler et al. (2020), in galaxies per mag per Mpc^3."""
+    # Evolving double power law of their Equation 1.
+    m_star = -21.03 + 0.49 * (redshift - 6)
+    phi_star = 10**-3.52
+    alpha = -1.99 - 0.09 * (redshift - 6)
+    beta = -4.92 + 0.45 * (redshift - 6)
+    return phi_star / (10**(0.4 * (alpha + 1) * (magnitude - m_star)) + 10**(0.4 * (beta + 1) * (magnitude - m_star)))
+
+
+def expected_number(luminosity_function, mag_limit, z_min, z_max, area):
+    """Number of galaxies brighter than an apparent magnitude expected in a field.
+
+    Parameters
+    ----------
+    luminosity_function : callable
+        Function of absolute magnitude and redshift that returns galaxies per mag per Mpc^3.
+    mag_limit : float
+        Apparent AB magnitude limit.
+    z_min, z_max : float
+        Redshift range.
+    area : float
+        Area of the field in square degrees.
+
+    Returns
+    -------
+    float
+        Expected number of galaxies, for a selection that finds all of them.
+    """
+    redshifts = np.linspace(z_min, z_max, 71)
+    absolute_magnitudes = np.linspace(-26, -15, 1101)
+    number_density = []
+    for redshift in redshifts:
+        faintest = mag_limit - cosmology.distmod(redshift).value + 2.5 * np.log10(1 + redshift)
+        bright_enough = absolute_magnitudes[absolute_magnitudes <= faintest]
+        number_density.append(np.trapezoid(luminosity_function(bright_enough, redshift), bright_enough))
+    volume = cosmology.differential_comoving_volume(redshifts).to_value(u.Mpc**3 / u.deg**2)
+    return area * np.trapezoid(np.array(number_density) * volume, redshifts)
+```
+
+As a check of the calculation, we compute the number that Allen et al. (2026) give in their Table 3: galaxies at z = 6 to 8 in the 53 square degrees of the Euclid Deep Fields, at a depth of 24.5 AB.
+They find 267 for a double power law and 231 for a Schechter function.
+Their numbers include the completeness of their selection and they use other fits of the luminosity function, so we expect to agree within a few tens of percent, not exactly.
+
+```{code-cell} ipython3
+for name, luminosity_function in [('Bowler et al. (2020), double power law', double_power_law_bowler),
+                                  ('Bouwens et al. (2021), Schechter', schechter_bouwens)]:
+    print(f'{name:40s} {expected_number(luminosity_function, 24.5, 6, 8, 53):5.0f}')
+```
+
+Now we compare with our candidates.
+We count the candidates brighter than each $H_E$ magnitude, and compute the expected number for the same magnitude, for the area of our circle and the redshift range of the candidates, z = 6 to 9.5.
+We use the total $H_E$ magnitudes of the forced photometry: the aperture magnitudes of the catalog are fainter than the total ones, and the expected number changes quickly with magnitude.
+
+```{code-cell} ipython3
+magnitudes = np.arange(23.0, 25.55, 0.1)
+expected = {name: np.array([expected_number(luminosity_function, magnitude, Z_HIGH, 9.5, area)
+                            for magnitude in magnitudes])
+            for name, luminosity_function in [('Bowler et al. (2020)', double_power_law_bowler),
+                                              ('Bouwens et al. (2021)', schechter_bouwens)]}
+
+measured = np.isfinite(followup['mag_h_total'])
+fig, ax = plt.subplots(figsize=(7, 5))
+for (name, numbers), linestyle in zip(expected.items(), ['-', '--']):
+    ax.plot(magnitudes, numbers, color='black', linestyle=linestyle, label=f'expected, {name}')
+for label, shown, color in [('SED candidates (catalog bands)', measured, 'tab:blue'),
+                            ('still candidates with IRAC', measured & followup['confirmed'], 'crimson')]:
+    counts = [np.sum(followup['mag_h_total'][shown] < magnitude) for magnitude in magnitudes]
+    ax.step(magnitudes, counts, where='post', color=color, label=label)
+ax.set_yscale('log')
+ax.set_ylim(0.01, 50)
+ax.set_xlabel('total $H_E$ magnitude (AB)')
+ax.set_ylabel(f'number brighter, in {area:.2f} square degrees')
+ax.legend(frameon=False, fontsize=9, loc='upper left')
+plt.show()
+
+for name, numbers in expected.items():
+    print(f'Expected brighter than H = 24.5: {np.interp(24.5, magnitudes, numbers):.1f} ({name})')
+for label, shown in [('SED candidates', measured), ('Still candidates with IRAC', measured & followup['confirmed'])]:
+    print(f"{label} brighter than H = 24.5: {np.sum(followup['mag_h_total'][shown] < 24.5)}")
+```
+
+**Figure 6.** Number of candidates brighter than a total $H_E$ magnitude in our field, before (blue) and after (red) the fits with IRAC, and the number of galaxies at z = 6 to 9.5 expected from two published luminosity functions (black).
+The expected numbers are for a selection that finds every galaxy, so they are upper limits for a real selection.
+
+Before the fits with IRAC, the candidates brighter than $H_E$ = 24.5 are about ten times more numerous than the galaxies that the luminosity functions predict (the numbers are printed above).
+After the fits with IRAC, two candidates brighter than 24.5 are left, where one to two galaxies are expected: the number is now consistent with the literature.
+With two sources this is a weak test, and it does not show that the candidates that are left are at z > 6.
+It does show that the sample from the Euclid and optical bands alone cannot be right, and that the IRAC bands remove most of the excess.
+
+At fainter magnitudes the expected number rises quickly, to tens of galaxies at $H_E$ = 25.5, and we find far fewer.
+This is expected too: our selection asks for S/N ≥ 5 in both $J_E$ and $H_E$ and for good flags, so it finds only a part of the galaxies near the detection limit.
+A measurement of the luminosity function needs this completeness, which is found by adding simulated galaxies to the images or the catalog, as Allen et al. do.
 
 ## Summary
 
 - The DR1 MER catalog can be read directly from Parquet files in the cloud. In less than a minute this gives the sources in 0.2 square degrees of EDF-N that are detected in $J_E$ and $H_E$ and not in $I_E$. The catalog has the Euclid and HSC fluxes in matched apertures, which is what an SED fit needs.
-- Of about 120 such sources, about a dozen are not detected in the optical, are best fit by a galaxy at z ≥ 6, and are fit worse by a star.
-- This is several times more than the number of z > 6 galaxies expected at these magnitudes. With the Euclid and optical bands only, the fits cannot separate high-redshift galaxies from brown dwarfs and from red galaxies at lower redshift.
-- Forced photometry on the IRAC mosaics adds the two bands that can. For the three candidates we followed up, the IRAC fluxes argue against z > 6.
+- Of about 120 such sources, 12 are not detected in the optical, are best fit by a galaxy at z ≥ 6, and are fit worse by a star.
+- This is about ten times the number of z > 6 galaxies expected at these magnitudes from published luminosity functions. With the Euclid and optical bands only, the fits cannot separate high-redshift galaxies from brown dwarfs and from red galaxies at lower redshift.
+- Forced photometry on the IRAC mosaics adds the two bands that can. With IRAC, eight of the 12 candidates are red galaxies at z ≈ 2, two are probably stars, and two are still candidates, which is consistent with the expected number.
+
+The main lesson is that of Allen et al. (2026): a z > 6 candidate selected in the Euclid bands is not reliable until it has been checked at 3.6 and 4.5 μm.
 
 This notebook shows the method, and its candidates are not a sample for science.
 An analysis like that of Allen et al. (2026) needs in addition:
 
-- image stamps and IRAC photometry of all candidates, not of three;
 - the masks around bright stars and the checks for persistence and ghosts in the near-infrared images;
 - total fluxes in all bands, measured in the same way;
 - a second SED fitting code and more complete sets of brown dwarf templates, and stricter cuts on p(z);
 - simulations of the completeness and the contamination of the selection, as in the first part of their paper;
 - spectroscopy of the best candidates.
 
-To go further, you can use a larger search circle (IRAC covers about half of EDF-N), follow up more candidates (`N_FOLLOWUP`), or ask for no detection in $Y_E$ to select z > 8 as Allen et al. did for Q1.
+To go further, you can use a larger search circle (IRAC covers about half of EDF-N), or ask for no detection in $Y_E$ to select z > 8 as Allen et al. did for Q1.
 
 ## References
 
@@ -961,6 +1164,11 @@ To go further, you can use a larger search circle (IRAC covers about half of EDF
 
 - Euclid Collaboration: Romelli, E., et al. (2025). *Euclid Quick Data Release (Q1): From images to multiwavelength catalogues: the Euclid MERge Processing Function*. [arXiv:2503.15305](https://arxiv.org/abs/2503.15305).
 - Euclid Collaboration: McPartland, C. J. R., et al. (2025). *Euclid preparation: The Cosmic Dawn Survey (DAWN) of the Euclid Deep and Auxiliary Fields*. A&A.
+
+**Luminosity functions**
+
+- Bouwens, R. J., Oesch, P. A., Stefanon, M., et al. (2021). *New Determinations of the UV Luminosity Functions from z~9 to z~2 Show a Remarkable Consistency with Halo Growth and a Constant Star Formation Efficiency*. AJ, 162, 47.
+- Bowler, R. A. A., Jarvis, M. J., Dunlop, J. S., et al. (2020). *A lack of evolution in the very bright end of the galaxy luminosity function from z ≃ 8 to 10*. MNRAS, 493, 2059.
 
 **Software**
 
