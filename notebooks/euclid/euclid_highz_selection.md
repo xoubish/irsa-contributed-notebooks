@@ -254,10 +254,9 @@ The DR1 MER catalog of the Euclid Deep Survey is in two tables that share the `o
 `mer_catalogue_deep_survey_photometry` has the photometry in the other external bands.
 In EDF-N the HSC $g$ and $z$ fluxes are in the first table, and the HSC $r$ and $i$ fluxes in the second, so we need both.
 
-IRSA serves these tables in two ways: with its TAP service, and as [HATS](https://hats.readthedocs.io/) catalogs, which are sets of Parquet files in an AWS S3 bucket.
-We read the Parquet files directly.
-This needs no service to run the search, and takes less than a minute for our circle.
-The IRSA tutorial [Euclid DR1 HATS Catalogs: Introduction](https://caltech-ipac.github.io/irsa-tutorials/euclid-dr1-hats-intro/) describes the catalogs and other ways to read them.
+IRSA keeps these tables as [HATS](https://hats.readthedocs.io/) catalogs, which are sets of Parquet files in an AWS S3 bucket.
+We read the Parquet files directly, which takes less than a minute for our circle.
+The IRSA tutorial [Euclid DR1 HATS Catalogs: Introduction](https://caltech-ipac.github.io/irsa-tutorials/euclid-dr1-hats-intro/) describes the catalogs.
 
 ```{code-cell} ipython3
 s3 = pyarrow.fs.S3FileSystem(anonymous=True, region='us-east-1')
@@ -758,8 +757,7 @@ Sources outside the field are not modeled, and the IRAC PSF spreads some of thei
 The fluxes in the Euclid bands are the same in both.
 This is accurate enough here, where the question is whether a candidate is one or two magnitudes brighter in IRAC than in $H_E$.
 
-`euclid_phot` can get the MER sources of a field itself, with a query to IRSA's TAP service.
-We give it the source list instead (`mer_catalog`), from the same Parquet files as in Section 1, so that this step does not depend on that service either.
+We give `euclid_phot` the source list (`mer_catalog`) from the same Parquet files as in Section 1.
 We read the columns that `euclid_phot` uses for all sources of our circle once, and save them in the `data` directory.
 
 ```{code-cell} ipython3
@@ -785,7 +783,7 @@ else:
 print(f'{len(all_sources)} MER sources')
 ```
 
-The next function selects the sources of one field from this table, and adds the columns that `euclid_phot` expects from its own query.
+The next function selects the sources of one field from this table, and adds the columns that `euclid_phot` expects in a source list.
 DR1 has no Sérsic shape measurements at IRSA yet, so these columns are empty and `euclid_phot` fits the shapes itself.
 
 ```{code-cell} ipython3
@@ -1192,6 +1190,6 @@ This tutorial uses Euclid DR1 data products distributed by the NASA/IPAC Infrare
 Euclid is a European Space Agency mission with contributions from NASA.
 The Spitzer/IRAC mosaics are from the Cosmic Dawn Survey.
 
-This notebook uses the Python packages NumPy, Matplotlib, Astropy, PyVO, eazy-py, Tractor and euclid_phot.
+This notebook uses the Python packages NumPy, Matplotlib, Astropy, PyArrow, astropy-healpix, eazy-py, Tractor and euclid_phot.
 
 The AI assistant Claude (Anthropic) was used to draft the notebook.

@@ -21,7 +21,7 @@ def as_float_array(column):
     Parameters
     ----------
     column : astropy.table.Column, astropy.table.MaskedColumn or array-like
-        Values to convert. Masked entries (for example the missing values of a TAP result) become NaN.
+        Values to convert. Masked entries (for example the missing values of a catalog) become NaN.
 
     Returns
     -------
